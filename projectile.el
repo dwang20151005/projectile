@@ -166,6 +166,15 @@ using the native indexing method."
   :group 'projectile
   :type 'boolean)
 
+(defcustom projectile-per-project-cache-file-function nil
+  "When non-nil, enables per-project cache files.
+
+Value is a function from the project root to the cache file for
+that project."
+  :group 'projectile
+  :type '(choice (const :tag "Use global cache file" nil)
+                 (function :tag "Function")))
+
 (defcustom projectile-file-exists-local-cache-expire nil
   "Number of seconds before file existence cache expires for a
 file on a local file system.
@@ -519,7 +528,9 @@ The saved data can be restored with `projectile-unserialize'."
         (read (buffer-string))))))
 
 (defvar projectile-projects-cache nil
-  "A hashmap used to cache project file names to speed up related operations.")
+  "A hashmap used to cache project file names to speed up related operations.
+
+The key is the project root. The value is a list of files in that project.")
 
 (defvar projectile-project-root-cache (make-hash-table :test 'equal)
   "Cached value of function `projectile-project-root`.")
@@ -674,7 +685,7 @@ to invalidate."
     (setq projectile-project-root-cache (make-hash-table :test 'equal))
     (remhash project-root projectile-project-type-cache)
     (remhash project-root projectile-projects-cache)
-    (projectile-serialize-cache)
+    (projectile-serialize-cache project-root)
     (when projectile-verbose
       (message "Invalidated Projectile cache for %s."
                (propertize project-root 'face 'font-lock-keyword-face))))
@@ -686,7 +697,7 @@ to invalidate."
 The cache is created both in memory and on the hard drive."
   (when projectile-enable-caching
     (puthash project files projectile-projects-cache)
-    (projectile-serialize-cache)))
+    (projectile-serialize-cache project)))
 
 ;;;###autoload
 (defun projectile-purge-file-from-cache (file)
@@ -696,11 +707,11 @@ The cache is created both in memory and on the hard drive."
           "Remove file from cache: "
           (projectile-current-project-files))))
   (let* ((project-root (projectile-project-root))
-         (project-cache (gethash project-root projectile-projects-cache)))
+         (project-cache (projectile-get-project-cache project-root)))
     (if (projectile-file-cached-p file project-root)
         (progn
           (puthash project-root (remove file project-cache) projectile-projects-cache)
-          (projectile-serialize-cache)
+          (projectile-serialize-cache project-root)
           (when projectile-verbose
             (message "%s removed from cache" file)))
       (error "%s is not in the cache" file))))
@@ -713,30 +724,33 @@ The cache is created both in memory and on the hard drive."
           "Remove directory from cache: "
           (projectile-current-project-dirs))))
   (let* ((project-root (projectile-project-root))
-         (project-cache (gethash project-root projectile-projects-cache)))
+         (project-cache (projectile-get-project-cache project-root)))
     (puthash project-root
              (cl-remove-if (lambda (str) (string-prefix-p dir str)) project-cache)
-             projectile-projects-cache)))
+             projectile-projects-cache)
+    (projectile-serialize-cache project-root)))
 
 (defun projectile-file-cached-p (file project)
   "Check if FILE is already in PROJECT cache."
-  (member file (gethash project projectile-projects-cache)))
+  (member file (projectile-get-project-cache project)))
 
 ;;;###autoload
 (defun projectile-cache-current-file ()
   "Add the currently visited file to the cache."
   (interactive)
-  (let ((current-project (projectile-project-root)))
-    (when (and (buffer-file-name) (gethash (projectile-project-root) projectile-projects-cache))
+  (let* ((current-project (projectile-project-root))
+        (project-cache (and (buffer-file-name)
+                            (projectile-get-project-cache current-project))))
+    (when project-cache
       (let* ((abs-current-file (file-truename (buffer-file-name)))
              (current-file (file-relative-name abs-current-file current-project)))
         (unless (or (projectile-file-cached-p current-file current-project)
                     (projectile-ignored-directory-p (file-name-directory abs-current-file))
                     (projectile-ignored-file-p abs-current-file))
           (puthash current-project
-                   (cons current-file (gethash current-project projectile-projects-cache))
+                   (cons current-file project-cache)
                    projectile-projects-cache)
-          (projectile-serialize-cache)
+          (projectile-serialize-cache current-project)
           (message "File %s added to project %s cache."
                    (propertize current-file 'face 'font-lock-keyword-face)
                    (propertize current-project 'face 'font-lock-keyword-face)))))))
@@ -994,9 +1008,9 @@ function `projectile-project-name' is called."
   "List the files in DIRECTORY and in its sub-directories.
 Files are returned as relative paths to the project root."
   ;; check for a cache hit first if caching is enabled
-  (let ((files-list (and projectile-enable-caching
-                         (gethash directory projectile-projects-cache)))
-        (root (projectile-project-root)))
+  (let* ((root (projectile-project-root))
+         (files-list (and projectile-enable-caching
+                          (projectile-get-project-cache root))))
     ;; cache disabled or cache miss
     (or files-list
         (if (eq projectile-indexing-method 'native)
@@ -1745,11 +1759,12 @@ https://github.com/abo-abo/swiper")))
 (defun projectile-current-project-files ()
   "Return a list of files for the current project."
   (let ((files (and projectile-enable-caching
-                    (gethash (projectile-project-root) projectile-projects-cache))))
+                    (projectile-get-project-cache (projectile-project-root)))))
     ;; nothing is cached
     (unless files
       (when projectile-enable-caching
-        (message "Empty cache. Projectile is initializing cache..."))
+        (message "Empty cache. Projectile is initializing cache: %S"
+                 projectile-project-root))
       (setq files (cl-mapcan
                    #'projectile-dir-files
                    (projectile-get-project-directories)))
@@ -3097,9 +3112,28 @@ For hg projects `monky-status' is used if available."
            (lambda (f) (string-prefix-p project-root f))
            recentf-list)))))
 
-(defun projectile-serialize-cache ()
+(defun projectile-serialize-cache (project-root)
   "Serializes the memory cache to the hard drive."
-  (projectile-serialize projectile-projects-cache projectile-cache-file))
+  (if (not projectile-per-project-cache-file-function)
+      (projectile-serialize projectile-projects-cache projectile-cache-file)
+    (let ((cache-file (funcall projectile-per-project-cache-file-function project-root))
+          (cache (gethash project-root projectile-projects-cache)))
+      (projectile-serialize cache cache-file))))
+
+(defun projectile-get-project-cache (project-root)
+  "Returns all files cached for project, unserializing from disk if necessary."
+  (if projectile-projects-cache
+      (or (gethash project-root projectile-projects-cache)
+          (when projectile-per-project-cache-file-function
+            (let* ((cache-file (funcall projectile-per-project-cache-file-function project-root))
+                   (cache (projectile-unserialize cache-file)))
+              (puthash project-root cache projectile-projects-cache)
+              cache)))
+    (setf projectile-projects-cache
+          (or (and (not projectile-per-project-cache-file-function)
+                   (projectile-unserialize projectile-cache-file))
+              (make-hash-table :test 'equal)))
+    (projectile-get-project-cache project-root)))
 
 (defvar projectile-compilation-cmd-map
   (make-hash-table :test 'equal)
@@ -3854,11 +3888,6 @@ Otherwise behave as if called interactively.
   :global t
   (cond
    (projectile-mode
-    ;; initialize the projects cache if needed
-    (unless projectile-projects-cache
-      (setq projectile-projects-cache
-            (or (projectile-unserialize projectile-cache-file)
-                (make-hash-table :test 'equal))))
     (add-hook 'find-file-hook 'projectile-find-file-hook-function)
     (add-hook 'projectile-find-dir-hook #'projectile-track-known-projects-find-file-hook t)
     (add-hook 'dired-before-readin-hook #'projectile-track-known-projects-find-file-hook t t)
